@@ -14,8 +14,10 @@ import { LIMB_LEN, Rig } from './rig';
 
 const ZONE_Y: Record<Zone, number> = { head: 1.62, torso: 1.2, armL: 1.25, armR: 1.25, legL: 0.55, legR: 0.55 };
 const MAX_CORPSES = 45;
+/** What the camera must not pass through or behind: the well and its roof, the cart, the gibbet and its cage. */
+const CAM_BLOCKERS = [{ x: 0, z: 0, r: 1.7, top: 3.05 }, { x: -7.5, z: 6, r: 1.9, top: 1.5 }, { x: 8, z: -6.5, r: 0.35, top: 5.1 }, { x: 9.8, z: -6.5, r: 0.5, top: 3.8 }];
 
-interface View { rig: Rig; f: Fighter; x: number; z: number; yaw: number; px: number; pz: number; kit?: string; sink: number }
+interface View { rig: Rig; f: Fighter; x: number; z: number; yaw: number; px: number; pz: number; vx: number; vz: number; kit?: string; sink: number; hitX: number; hitZ: number; hitHeavy: boolean }
 interface Spurt { view: View; limb: Limb; t: number }
 interface Glint { s: THREE.Sprite; t: number }
 
@@ -77,6 +79,7 @@ export class GameRenderer {
   private trailPts: THREE.Vector3[] = [];
   private debug = new THREE.Group();
   private focus = new THREE.Vector3(0, 1.4, -5);
+  private boom = 4.5;
   private camYaw = 0;
   private trauma = 0;
   private hurt = 0;
@@ -123,7 +126,8 @@ export class GameRenderer {
     window.addEventListener('resize', () => this.resize());
   }
 
-  async init(): Promise<void> { await this.gore.init(); }
+  /** Physics loads in the background: the title screen should not wait on most of the download. */
+  init(): Promise<void> { this.gore.init().catch((e) => console.warn('Physics unavailable; limbs will not fly.', e)); return Promise.resolve(); }
   setGore(level: GoreLevel): void { this.gore.level = level; }
 
   resize(): void {
@@ -138,21 +142,22 @@ export class GameRenderer {
 
   private makeView(f: Fighter, kit?: string): View {
     const knight = f.def.look === 'knight';
-    const rig = new Rig(f.elite ? 'foreman' : f.def.look, f.weapon?.model ?? null, { scale: knight ? 1.1 : (f.def.scale ?? 1) * (f.elite ? 1.18 : 0.93 + ((f.id * 37) % 13) / 100), kit, shield: !!f.shield, twoHanded: f.weapon?.twoHanded, seed: f.id * 2654435761 >>> 8 });
+    const rig = new Rig(f.elite ? 'foreman' : f.def.look, f.weapon?.model ?? null, { scale: knight ? 1.16 : (f.def.scale ?? 1) * (f.elite ? 1.1 : 0.93 + ((f.id * 37) % 13) / 100), kit, shield: !!f.shield, twoHanded: f.weapon?.twoHanded, seed: f.id * 2654435761 >>> 8 });
     this.scene.add(rig.root);
-    const v: View = { rig, f, x: f.x, z: f.z, yaw: f.facing, px: f.x, pz: f.z, kit, sink: 0 };
+    const v: View = { rig, f, x: f.x, z: f.z, yaw: f.facing, px: f.x, pz: f.z, vx: 0, vz: 0, kit, sink: 0, hitX: 0, hitZ: 1, hitHeavy: false };
     rig.root.position.set(f.x, 0, f.z); rig.root.rotation.y = f.facing;
     return v;
   }
 
-  private syncViews(world: World, dt: number): void {
+  private syncViews(world: World, dt: number, lock: number): void {
     const live = new Set<number>();
     for (const f of world.fighters) {
       live.add(f.id);
       let v = this.views.get(f.id);
+      if (v && v.rig.ragdoll && f.state !== 'dead') { v.rig.dispose(); this.views.delete(f.id); v = undefined; } // back from the dead (retry)
       if (v && f === world.knight && (v.kit !== world.kitId || (f.weapon && !v.rig.weapon && f.limbs.armR.state === 'ok') || (f.limbs.head.state === 'ok' && !v.rig.hasLimb('head')) || this.knightNeedsLimbs(v, f))) {
         // New kit, or the barber-surgeon has been: rebuild the knight.
-        v.rig.root.removeFromParent(); this.views.delete(f.id); v = undefined;
+        v.rig.dispose(); this.views.delete(f.id); v = undefined;
       }
       if (!v) { v = this.makeView(f, f === world.knight ? world.kitId : undefined); this.views.set(f.id, v); }
       v.rig.root.visible = f.state !== 'gone';
@@ -162,18 +167,25 @@ export class GameRenderer {
       v.yaw += angleDiff(f.facing, v.yaw) * (1 - Math.exp(-22 * dt));
       v.rig.root.position.set(v.x, 0, v.z);
       v.rig.root.rotation.y = v.yaw;
-      const speed = Math.hypot(v.x - v.px, v.z - v.pz) / Math.max(dt, 1e-4);
-      const moveDot = speed > 0.1 ? ((v.x - v.px) * Math.sin(v.yaw) + (v.z - v.pz) * Math.cos(v.yaw)) / (speed * dt) : 1;
-      v.rig.update(f, dt, f.state === 'idle' || f.state === 'block' ? speed : 0, moveDot);
+      if (dt > 0) { v.vx = (v.x - v.px) / dt; v.vz = (v.z - v.pz) / dt; }
+      // Ground velocity in the fighter's own frame drives the stride: forward, backward or sideways.
+      const walking = f.state === 'idle' || f.state === 'block';
+      const c = Math.cos(v.yaw), sn = Math.sin(v.yaw);
+      const fwd = walking ? v.vx * sn + v.vz * c : 0, side = walking ? v.vx * c - v.vz * sn : 0;
+      // Eyes on the enemy: peasants watch the knight, the knight watches his target.
+      const tid = f.team === 1 ? (f.ai?.mode === 'flee' || f.ai?.mode === 'cower' ? 0 : world.knight.id) : lock || f.softTarget;
+      const tv = tid ? this.views.get(tid) : undefined;
+      v.rig.lookAt = tv ? (v.rig.lookAt ?? new THREE.Vector3()).set(tv.x, 1.55 * tv.rig.scale, tv.z) : null;
+      v.rig.update(f, dt, fwd, side);
       v.rig.setBlood(f.blood);
     }
     for (const [id, v] of this.views) {
       if (live.has(id)) continue;
       this.views.delete(id);
-      if (v.f.state === 'dead') { this.corpses.push(v); } else v.rig.root.removeFromParent();
+      if (v.f.state === 'dead') { this.corpses.push(v); } else v.rig.dispose();
     }
-    while (this.corpses.length > MAX_CORPSES) this.corpses.shift()!.rig.root.removeFromParent();
-    for (const c of this.corpses) c.rig.update(c.f, dt, 0, 1);
+    while (this.corpses.length > MAX_CORPSES) this.corpses.shift()!.rig.dispose();
+    for (const c of this.corpses) c.rig.update(c.f, dt);
   }
   private knightNeedsLimbs(v: View, f: Fighter): boolean {
     for (const l of ['armL', 'armR', 'legL', 'legR'] as Limb[]) if (f.limbs[l].state === 'ok' && !v.rig.hasLimb(l)) return true;
@@ -181,7 +193,7 @@ export class GameRenderer {
   }
 
   clearField(): void {
-    for (const c of this.corpses) c.rig.root.removeFromParent();
+    for (const c of this.corpses) c.rig.dispose();
     this.corpses = [];
     this.gore.clear();
   }
@@ -200,6 +212,7 @@ export class GameRenderer {
         const knight = e.id === world.knight.id || e.by === world.knight.id;
         if (knight) this.trauma = Math.min(1, this.trauma + (e.heavy ? 0.5 : 0.28) + (e.killed ? 0.12 : 0));
         if (e.id === world.knight.id) this.hurt = Math.min(1, this.hurt + 0.35 + e.dmg / 40);
+        if (v) { v.hitX = e.dirX; v.hitZ = e.dirZ; v.hitHeavy = e.heavy; if (!e.killed) v.rig.flinch(e.dirX, e.dirZ, (e.heavy ? 1.3 : 0.8) * Math.min(1.4, 0.5 + e.dmg / 25)); }
         break;
       }
       case 'sever': if (v) this.sever(v, e.limb, e.dirX, e.dirZ, e.force); break;
@@ -218,12 +231,16 @@ export class GameRenderer {
         this.trauma = Math.min(1, this.trauma + 0.35);
         break;
       }
-      case 'block':
+      case 'block': {
+        const a = this.views.get(e.by);
         if (v) this.glint(v, 0.9, 0xffe0b0, true);
+        if (v && a) { const d = Math.hypot(v.x - a.x, v.z - a.z) || 1; v.rig.flinch((v.x - a.x) / d, (v.z - a.z) / d, e.broke ? 0.9 : 0.4); }
         this.trauma = Math.min(1, this.trauma + (e.broke ? 0.45 : 0.2));
         break;
+      }
       case 'death':
         if (v && v.f.team === 1 && v.rig.weapon?.parent && Math.random() < 0.7) this.flingItem(v, 'weapon', 0, 0);
+        if (v) this.ragdoll(v);
         break;
       case 'knockdown': this.trauma = Math.min(1, this.trauma + 0.12); break;
     }
@@ -237,7 +254,7 @@ export class GameRenderer {
   }
 
   private sever(v: View, limb: Limb, dirX: number, dirZ: number, force: number): void {
-    const g = v.rig.limbGroup(limb);
+    const g = v.rig.detachLimb(limb);
     if (!g) return;
     if (limb === 'armR') this.flingItem(v, 'weapon', dirX, dirZ);
     if (limb === 'armL') this.flingItem(v, 'shield', dirX, dirZ);
@@ -248,6 +265,15 @@ export class GameRenderer {
     this.gore.fling(g, limb === 'head' ? 0.01 : LIMB_LEN[limb], limb === 'head' ? 0.12 : 0.07, vel, 1);
     this.spurts.push({ view: v, limb, t: limb === 'head' ? 2.2 : 3.2 });
     this.trauma = Math.min(1, this.trauma + 0.2);
+  }
+
+  /** The body goes limp and falls the way the blow sent it. Falls back to the death pose until physics has loaded. */
+  private ragdoll(v: View): void {
+    const R = this.gore.R, w = this.gore.physics;
+    if (!R || !w || v.rig.ragdoll) return;
+    const push = (v.hitHeavy ? 4.2 : 2.8) * (v.f.elite ? 0.6 : 1);
+    const r = v.rig.startRagdoll(R, w, new THREE.Vector3(v.vx * 0.8, 0, v.vz * 0.8), new THREE.Vector3(v.hitX * push, 1.2, v.hitZ * push));
+    this.gore.addRagdoll(r);
   }
 
   private glint(v: View, size: number, color: number, atHand = false): void {
@@ -263,7 +289,7 @@ export class GameRenderer {
 
   frame(world: World, dt: number, simDt: number, o: FrameOpts): void {
     this.time += dt;
-    this.syncViews(world, simDt);
+    this.syncViews(world, simDt, o.lock);
     const kv = this.views.get(world.knight.id)!;
     const k = world.knight;
 
@@ -394,9 +420,17 @@ export class GameRenderer {
     const shoulder = 0.6 * (1 - this.fin);
     const at = (d: number, out: THREE.Vector3) => out.set(this.focus.x - fx * d + rx * shoulder, this.focus.y - fy * d + 0.25, this.focus.z - fz * d + rz * shoulder);
     const p = new THREE.Vector3();
-    // Stay inside the palisade and above the mud: shorten the boom rather than clip.
-    for (let i = 0; i < 6; i++) { at(dist, p); if (Math.hypot(p.x, p.z) > R + 0.2 || p.y < 0.35) dist *= 0.86; else break; }
-    at(dist, p);
+    // Stay inside the palisade and above the mud, and never let the well, the cart or the gibbet
+    // come between the camera and the knight: shorten the boom to just in front of them.
+    const inside = (q: THREE.Vector3) => Math.hypot(q.x, q.z) > R + 0.2 || q.y < 0.35 || CAM_BLOCKERS.some((b) => q.y < b.top && Math.hypot(q.x - b.x, q.z - b.z) < b.r);
+    const q = new THREE.Vector3();
+    for (let k = 1; k <= 12; k++) {
+      at((dist * k) / 12, q);
+      if (inside(q)) { dist = Math.max(0.9, (dist * (k - 1)) / 12 - 0.1); break; }
+    }
+    // Pull in fast, let out slowly, so the camera never pops back through a post.
+    this.boom = dist < this.boom ? dist + (this.boom - dist) * Math.exp(-25 * dt) : dist + (this.boom - dist) * Math.exp(-2.5 * dt);
+    at(this.boom, p);
     p.y = Math.max(0.35, p.y);
     this.camera.position.copy(p);
     this.camera.lookAt(this.focus.x + fx * 4 + rx * shoulder, this.focus.y + fy * 4 + 0.15, this.focus.z + fz * 4 + rz * shoulder);

@@ -2,11 +2,15 @@ import * as THREE from 'three';
 import type { Fighter, Limb } from '../sim/types';
 import { buildKnight } from './models/knight';
 import { BLOOD_LEVELS, material, type Kind } from './models/materials';
-import { buildPeasant, stump, type Seg } from './models/peasants';
+import { buildPeasant, stump, type Part, type Seg } from './models/peasants';
 import { buildShield, buildWeapon } from './models/weapons';
+import { Ragdoll, type RapierNS } from './ragdoll';
+import { BONES, skinParts, type BoneName, type SkinGroup } from './skin';
+import type * as RAPIER from '@dimforge/rapier3d-compat';
 
-// The skeleton and its procedural animation (two-bone arm IK driven by hand targets, FK legs).
-// The meshes hung on it are sculpted in ./models. The joint names and the "pose" structure are
+// The skeleton and its procedural animation (two-bone arm IK driven by hand targets, FK legs),
+// with springs for weight, a stride locked to ground speed, hit flinches and head tracking.
+// The meshes are sculpted in ./models and skinned to these bones in ./skin. The joint names and the "pose" structure are
 // the seam where authored glTF models and animation clips could drop in later.
 //
 // Character space: +Z forward, +Y up, +X is the character's LEFT.
@@ -92,46 +96,64 @@ const ease = (t: number) => t * t * (3 - 2 * t);
 
 // ------------------------------------------------------------------ the rig
 
-interface Arm { upper: THREE.Group; fore: THREE.Group; hand: THREE.Group }
-interface Leg { thigh: THREE.Group; shin: THREE.Group }
+interface Arm { upper: THREE.Bone; fore: THREE.Bone; hand: THREE.Bone }
+interface Leg { thigh: THREE.Bone; shin: THREE.Bone; foot: THREE.Bone }
 let stumpGeo: Record<string, THREE.BufferGeometry> | null = null;
+const skinCache = new WeakMap<Part[], SkinGroup[]>();
+const FOOT_OFFSET = new THREE.Matrix4().makeTranslation(0, ANKLE, 0);
+
+/** Critically damped spring toward a target. Exact for any dt, so a long frame never overshoots or explodes. */
+function spring(x: number, v: number, target: number, w: number, dt: number): [number, number] {
+  const y = x - target, e = Math.exp(-w * dt), tmp = (v + w * y) * dt;
+  return [target + (y + tmp) * e, (v - w * tmp) * e];
+}
 
 export class Rig {
   root = new THREE.Group();
-  body = new THREE.Group();
-  hips = new THREE.Group();
+  body = new THREE.Bone();
+  hips = new THREE.Bone();
   /** Waist joint: lean and twist pivot here, so the ribcage bends over the belt rather than swinging from the neck. */
-  spine = new THREE.Group();
-  chest = new THREE.Group();
-  head = new THREE.Group();
+  spine = new THREE.Bone();
+  chest = new THREE.Bone();
+  head = new THREE.Bone();
   arms: { L: Arm; R: Arm };
   legs: { L: Leg; R: Leg };
-  private skirts = { L: new THREE.Group(), R: new THREE.Group() };
-  /** Ankles: feet stay flat on the mud whatever the knees are doing. */
-  private feet = { L: new THREE.Group(), R: new THREE.Group() };
+  private skirts = { L: new THREE.Bone(), R: new THREE.Bone() };
+  skeleton: THREE.Skeleton;
   weapon: THREE.Group | null = null;
   shield: THREE.Group | null = null;
   /** Body-side wounds, shown when the limb goes. */
   stumps = {} as Record<Limb, THREE.Mesh>;
-  /** Limb-side wounds: the cut end of the piece that flies off. */
-  private caps = {} as Record<Limb, THREE.Mesh>;
-  private stained: THREE.Mesh[] = [];
+  /** Set by the renderer each frame: a world point to turn the head toward. */
+  lookAt: THREE.Vector3 | null = null;
+  ragdoll: Ragdoll | null = null;
+  private parts: Part[];
+  private meshes: THREE.SkinnedMesh[] = [];
+  private gone = new Set<Limb>();
+  private broken = new Set<string>();
   private bloodLevel = 0;
   private pose: Pose;
+  private vel: Pose;
   private idleKey: string;
   private walk = 0;
   private seed = Math.random() * 10;
   private fall = Math.random() < 0.5 ? 1 : -1;
+  private headScale: number;
+  /** Additive hit reaction: an underdamped spring on the spine (x: pitch, z: roll). */
+  private fl = { x: 0, vx: 0, z: 0, vz: 0 };
+  private gaze = { yaw: 0, vy: 0, pitch: 0, vp: 0 };
+  private clock = 0;
   twoHanded = false;
   scale = 1;
-  private byPiece = new Map<string, THREE.Mesh[]>();
-  private hiddenUntil = new Map<string, THREE.Mesh[]>();
+  private byPiece = new Map<string, THREE.Object3D[]>();
+  private hiddenUntil = new Map<string, THREE.Object3D[]>();
 
   constructor(public look: string, weaponModel: string | null, opts: { scale?: number; kit?: string; shield?: boolean; twoHanded?: boolean; seed?: number } = {}) {
     this.scale = opts.scale ?? 1;
     this.twoHanded = !!opts.twoHanded;
     this.idleKey = look === 'knight' ? 'knight' : weaponModel === 'pitchfork' || weaponModel === 'rake' ? 'fork' : weaponModel === 'axe' ? 'axe' : 'one';
     this.pose = structuredClone(IDLE[this.idleKey]);
+    this.vel = { rh: [0, 0, 0], rdir: [0, 0, 0], lh: [0, 0, 0], ldir: [0, 0, 0], twist: 0, lean: 0, crouch: 0, stance: 0, pitch: 0, lift: 0, headPitch: 0, roll: 0 };
     this.root.add(this.body);
     this.body.add(this.hips);
     this.hips.position.y = DIM.hip;
@@ -142,40 +164,53 @@ export class Rig {
     this.chest.add(this.head);
     this.head.position.y = 0.06;
     const arm = (side: number): Arm => {
-      const upper = new THREE.Group(), fore = new THREE.Group(), hand = new THREE.Group();
+      const upper = new THREE.Bone(), fore = new THREE.Bone(), hand = new THREE.Bone();
       upper.position.set(side * DIM.shoulder, -0.03, 0);
       fore.position.y = -DIM.upper; hand.position.y = -DIM.fore;
       upper.add(fore); fore.add(hand); this.chest.add(upper);
       return { upper, fore, hand };
     };
     const leg = (side: number): Leg => {
-      const thigh = new THREE.Group(), shin = new THREE.Group();
-      thigh.position.set(side * DIM.legX, 0, 0); shin.position.y = -DIM.thigh;
-      thigh.add(shin); this.hips.add(thigh);
-      const foot = side > 0 ? this.feet.L : this.feet.R;
-      foot.position.y = -ANKLE; shin.add(foot);
-      return { thigh, shin };
+      const thigh = new THREE.Bone(), shin = new THREE.Bone(), foot = new THREE.Bone();
+      thigh.position.set(side * DIM.legX, 0, 0); shin.position.y = -DIM.thigh; foot.position.y = -ANKLE;
+      thigh.add(shin); shin.add(foot); this.hips.add(thigh);
+      return { thigh, shin, foot };
     };
     this.arms = { L: arm(1), R: arm(-1) };
     this.legs = { L: leg(1), R: leg(-1) };
-
-    const groups: Record<Seg, THREE.Object3D> = {
-      hips: this.hips, chest: this.chest, head: this.head,
-      upperL: this.arms.L.upper, upperR: this.arms.R.upper, foreL: this.arms.L.fore, foreR: this.arms.R.fore, handL: this.arms.L.hand, handR: this.arms.R.hand,
-      thighL: this.legs.L.thigh, thighR: this.legs.R.thigh, shinL: this.legs.L.shin, shinR: this.legs.R.shin, footL: this.feet.L, footR: this.feet.R, skirtL: this.skirts.L, skirtR: this.skirts.R,
-    };
-    const parts = look === 'knight' ? buildKnight(opts.kit ?? 'mail') : buildPeasant(look, opts.seed ?? 0);
-    for (const p of parts) {
-      const m = new THREE.Mesh(p.geo, p.decal ?? material(p.kind, 0));
-      m.castShadow = !p.decal; m.receiveShadow = false;
-      if (!p.decal) { m.userData.kind = p.kind; this.stained.push(m); }
-      if (p.seg === 'footL' || p.seg === 'footR') m.position.y = ANKLE; // foot meshes are modelled in shin space
-      groups[p.seg].add(m);
-      for (const id of [p.piece, p.hideWith]) if (id) { const l = this.byPiece.get(id) ?? []; l.push(m); this.byPiece.set(id, l); }
-      if (p.showWhenBroken) { m.visible = false; const l = this.hiddenUntil.get(p.showWhenBroken) ?? []; l.push(m); this.hiddenUntil.set(p.showWhenBroken, l); }
-    }
     // Peasant heads are a touch oversized: caricature reads better at fighting distance.
-    this.head.scale.setScalar(look === 'knight' ? 1.07 : 1.13);
+    this.headScale = look === 'knight' ? 1.07 : 1.13;
+    this.head.scale.setScalar(this.headScale);
+
+    const bones: Record<BoneName, THREE.Bone> = {
+      body: this.body, hips: this.hips, spine: this.spine, chest: this.chest, head: this.head,
+      upperL: this.arms.L.upper, foreL: this.arms.L.fore, handL: this.arms.L.hand, upperR: this.arms.R.upper, foreR: this.arms.R.fore, handR: this.arms.R.hand,
+      thighL: this.legs.L.thigh, shinL: this.legs.L.shin, footL: this.legs.L.foot, thighR: this.legs.R.thigh, shinR: this.legs.R.shin, footR: this.legs.R.foot,
+      skirtL: this.skirts.L, skirtR: this.skirts.R,
+    };
+    for (const n of BONES) bones[n].name = n;
+    this.root.updateMatrixWorld(true);
+    this.skeleton = new THREE.Skeleton(BONES.map((n) => bones[n]));
+
+    this.parts = look === 'knight' ? buildKnight(opts.kit ?? 'mail') : buildPeasant(look, opts.seed ?? 0);
+    let groups = skinCache.get(this.parts);
+    if (!groups) {
+      const rest = Object.fromEntries(BONES.map((n) => [n, bones[n].matrixWorld.clone()])) as Record<BoneName, THREE.Matrix4>;
+      groups = skinParts(this.parts, rest, { footL: FOOT_OFFSET, footR: FOOT_OFFSET });
+      skinCache.set(this.parts, groups);
+    }
+    const bind = new THREE.Matrix4();
+    for (const g of groups) {
+      const m = new THREE.SkinnedMesh(g.geo, g.decal ?? material(g.kind, 0));
+      m.bind(this.skeleton, bind);
+      m.frustumCulled = false; // bounds are for the bind pose; a falling body leaves them
+      m.castShadow = !g.decal;
+      m.userData.kind = g.decal ? null : g.kind;
+      this.root.add(m);
+      this.meshes.push(m);
+      for (const id of [g.piece, g.hideWith]) if (id) { const l = this.byPiece.get(id) ?? []; l.push(m); this.byPiece.set(id, l); }
+      if (g.showWhenBroken) { m.visible = false; const l = this.hiddenUntil.get(g.showWhenBroken) ?? []; l.push(m); this.hiddenUntil.set(g.showWhenBroken, l); }
+    }
     this.addWounds();
     if (weaponModel) { this.weapon = buildWeapon(weaponModel); this.arms.R.hand.add(this.weapon); this.weapon.position.set(0, -0.045, 0); }
     if (opts.shield) { this.shield = buildShield(); this.arms.L.hand.add(this.shield); }
@@ -195,16 +230,17 @@ export class Rig {
     this.stumps.armR = mk(this.chest, stumpGeo.arm, [-DIM.shoulder + 0.02, -0.035, 0], [0, 0, -H]);
     this.stumps.legL = mk(this.hips, stumpGeo.leg, [DIM.legX, -0.07, 0], [0, 0, 0]);
     this.stumps.legR = mk(this.hips, stumpGeo.leg, [-DIM.legX, -0.07, 0], [0, 0, 0]);
-    // limb side
-    this.caps.head = mk(this.head, stumpGeo.neck, [0, -0.02, 0], [0, 0, 0]);
-    this.caps.armL = mk(this.arms.L.upper, stumpGeo.arm, [-0.02, 0.01, 0], [0, 0, -H * 1.3]);
-    this.caps.armR = mk(this.arms.R.upper, stumpGeo.arm, [0.02, 0.01, 0], [0, 0, H * 1.3]);
-    this.caps.legL = mk(this.legs.L.thigh, stumpGeo.leg, [0, 0.03, 0], [Math.PI, 0, 0]);
-    this.caps.legR = mk(this.legs.R.thigh, stumpGeo.leg, [0, 0.03, 0], [Math.PI, 0, 0]);
+  }
+
+  private visiblePart(p: Part): boolean {
+    if (p.showWhenBroken) return this.broken.has(p.showWhenBroken);
+    for (const id of [p.piece, p.hideWith]) if (id && this.broken.has(id)) return false;
+    return true;
   }
 
   /** A broken armour piece falls away, leaving the gambeson (or the man) underneath. */
   breakArmour(piece: string): void {
+    this.broken.add(piece);
     for (const m of this.byPiece.get(piece) ?? []) m.visible = false;
     for (const m of this.hiddenUntil.get(piece) ?? []) m.visible = true;
   }
@@ -214,19 +250,71 @@ export class Rig {
     const lvl = Math.min(BLOOD_LEVELS - 1, Math.floor(v * BLOOD_LEVELS));
     if (lvl === this.bloodLevel) return;
     this.bloodLevel = lvl;
-    for (const m of this.stained) m.material = material(m.userData.kind as Kind, lvl);
+    for (const m of this.meshes) if (m.userData.kind) m.material = material(m.userData.kind as Kind, lvl);
   }
 
-  /** The limb's group, ready to hand to the gore system; null if it is already gone. Shows the cut end. */
-  limbGroup(limb: Limb): THREE.Group | null {
-    const g = limb === 'head' ? this.head : limb === 'armL' ? this.arms.L.upper : limb === 'armR' ? this.arms.R.upper : limb === 'legL' ? this.legs.L.thigh : this.legs.R.thigh;
-    if (!g.parent) return null;
-    this.caps[limb].visible = true;
-    return g;
+  /**
+   * Take a limb off. The limb's bones collapse to nothing on the body, and a rigid copy of the
+   * limb, posed exactly as it was, is returned (still parented, so it has a world transform) for
+   * the gore system to throw. Returns null if the limb is already gone.
+   */
+  detachLimb(limb: Limb): THREE.Group | null {
+    if (this.gone.has(limb)) return null;
+    this.gone.add(limb);
+    const s = limb.endsWith('L') ? 'L' : 'R';
+    const chain: [Seg, THREE.Bone][] = limb === 'head' ? [['head', this.head]]
+      : limb.startsWith('arm') ? [[`upper${s}` as Seg, this.arms[s].upper], [`fore${s}` as Seg, this.arms[s].fore], [`hand${s}` as Seg, this.arms[s].hand]]
+      : [[`thigh${s}` as Seg, this.legs[s].thigh], [`shin${s}` as Seg, this.legs[s].shin], [`foot${s}` as Seg, this.legs[s].foot]];
+    let top: THREE.Group | null = null, parent: THREE.Object3D | null = null;
+    for (const [seg, bone] of chain) {
+      const g = new THREE.Group();
+      g.position.copy(bone.position); g.quaternion.copy(bone.quaternion); g.scale.copy(bone.scale);
+      for (const p of this.parts) {
+        if (p.seg !== seg || !this.visiblePart(p)) continue;
+        const m = new THREE.Mesh(p.geo, p.decal ?? material(p.kind, this.bloodLevel));
+        m.castShadow = !p.decal;
+        if (seg.startsWith('foot')) m.position.y = ANKLE;
+        g.add(m);
+      }
+      if (parent) parent.add(g); else top = g;
+      parent = g;
+    }
+    // The cut end of the piece that flies off.
+    stumpGeo ??= { neck: stump(0.05), arm: stump(0.058), leg: stump(0.078) };
+    const H = Math.PI / 2;
+    const cap = new THREE.Mesh(limb === 'head' ? stumpGeo.neck : limb.startsWith('arm') ? stumpGeo.arm : stumpGeo.leg, material('matte', 0));
+    if (limb === 'head') cap.position.set(0, -0.02, 0);
+    else if (limb.startsWith('arm')) { cap.position.set(s === 'L' ? -0.02 : 0.02, 0.01, 0); cap.rotation.z = (s === 'L' ? -H : H) * 1.3; }
+    else { cap.position.set(0, 0.03, 0); cap.rotation.x = Math.PI; }
+    top!.add(cap);
+    chain[0][1].parent!.add(top!);
+    chain[0][1].scale.setScalar(1e-4);
+    return top;
   }
-  hasLimb(limb: Limb): boolean {
-    const g = limb === 'head' ? this.head : limb === 'armL' ? this.arms.L.upper : limb === 'armR' ? this.arms.R.upper : limb === 'legL' ? this.legs.L.thigh : this.legs.R.thigh;
-    return !!g.parent;
+  hasLimb(limb: Limb): boolean { return !this.gone.has(limb); }
+
+  /** A blow lands: rock the spine and head along the direction of the blow (world space). */
+  flinch(dirX: number, dirZ: number, strength: number): void {
+    const yaw = this.root.rotation.y, c = Math.cos(yaw), s = Math.sin(yaw);
+    const lx = dirX * c - dirZ * s, lz = dirX * s + dirZ * c;
+    this.fl.vx += lz * strength * 7;
+    this.fl.vz -= lx * strength * 7;
+  }
+
+  /** Hand the body to physics. `vel` is how it was moving, `push` the blow that killed it. */
+  startRagdoll(R: RapierNS, world: RAPIER.World, vel: THREE.Vector3, push: THREE.Vector3): Ragdoll {
+    this.ragdoll?.freeze();
+    this.ragdoll = new Ragdoll(R, world, {
+      root: this.root, body: this.body, hips: this.hips, spine: this.spine, chest: this.chest, head: this.head,
+      upperL: this.arms.L.upper, foreL: this.arms.L.fore, upperR: this.arms.R.upper, foreR: this.arms.R.fore,
+      thighL: this.legs.L.thigh, shinL: this.legs.L.shin, thighR: this.legs.R.thigh, shinR: this.legs.R.shin, skirtL: this.skirts.L, skirtR: this.skirts.R,
+    }, this.scale, this.headScale, this.gone, vel, push);
+    return this.ragdoll;
+  }
+
+  dispose(): void {
+    this.ragdoll?.freeze();
+    this.root.removeFromParent();
   }
 
   // ---------------------------------------------------------------- animation
@@ -303,7 +391,7 @@ export class Rig {
   private static FWD = new THREE.Vector3(0, 0, 1);
 
   private solveArm(arm: Arm, side: number, hand: V3, dir: V3): void {
-    if (!arm.upper.parent) return;
+    if (this.gone.has(side > 0 ? 'armL' : 'armR')) return;
     const s = this._a.set(side * DIM.shoulder, -0.03, 0);
     const t = this._b.set(hand[0], hand[1], hand[2]).sub(s);
     const maxLen = DIM.upper + DIM.fore - 0.005;
@@ -327,47 +415,84 @@ export class Rig {
     arm.hand.quaternion.copy(this._q).invert().multiply(qh);
   }
 
-  private solveLeg(leg: Leg, swing: number, knee: number, crouchA: number, spread: number): void {
-    leg.thigh.rotation.set(-swing - crouchA, 0, spread);
+  /** FK leg. `fx`/`fz` swing the thigh forward and sideways, so strafing steps sideways instead of moonwalking. */
+  private solveLeg(leg: Leg, fx: number, fz: number, knee: number, crouchA: number, spread: number): void {
+    leg.thigh.rotation.set(-fx - crouchA, 0, spread + fz);
     leg.shin.rotation.set(knee + crouchA * 2, 0, 0);
-    // Level the foot, easing off as the leg swings through so the toe still lifts and drops.
-    (leg.shin.children.find((c) => c === this.feet.L || c === this.feet.R) as THREE.Group | undefined)?.rotation.set(-(leg.thigh.rotation.x + leg.shin.rotation.x) * (Math.abs(this.pose.pitch) < 0.5 ? 0.85 : 0), 0, -spread);
+    // Keep the foot flat on the ground, easing off as the leg swings through so the toe still lifts and drops.
+    const level = Math.abs(this.pose.pitch) < 0.5 ? 0.85 : 0;
+    leg.foot.rotation.set(-(leg.thigh.rotation.x + leg.shin.rotation.x) * level, 0, -(spread + fz) * level);
   }
 
-  /** Advance the procedural animation toward this fighter's current state. */
-  update(f: Fighter, dt: number, speed: number, moveDot: number): void {
+  /**
+   * Advance the procedural animation toward this fighter's current state.
+   * `fwd` and `side` are the fighter's ground velocity in its own frame (m/s; side is +X, its left).
+   */
+  update(f: Fighter, dt: number, fwd = 0, side = 0): void {
+    if (this.ragdoll) { this.ragdoll.apply(); return; }
+    if (dt <= 0) return;
+    this.clock += dt;
     const { pose: tgt, rate } = this.target(f, dt);
-    const k = 1 - Math.exp(-rate * dt);
-    const p = this.pose;
-    for (const key of ['rh', 'rdir', 'lh', 'ldir'] as const) for (let i = 0; i < 3; i++) p[key][i] = lerp(p[key][i], tgt[key][i], k);
-    for (const key of ['twist', 'lean', 'crouch', 'stance', 'pitch', 'lift', 'headPitch', 'roll'] as const) p[key] = lerp(p[key], tgt[key], k);
+    // Springs rather than plain easing: limbs accelerate into a move and carry momentum out of it.
+    const w = rate * 0.85, p = this.pose, v = this.vel;
+    for (const key of ['rh', 'rdir', 'lh', 'ldir'] as const) for (let i = 0; i < 3; i++) [p[key][i], v[key][i]] = spring(p[key][i], v[key][i], tgt[key][i], w, dt);
+    for (const key of ['twist', 'lean', 'crouch', 'stance', 'pitch', 'lift', 'headPitch', 'roll'] as const) [p[key], v[key]] = spring(p[key], v[key], tgt[key], w, dt);
 
-    // Legs: stride length follows actual ground speed so feet don't skate much.
-    const moving = Math.min(1, speed / 3.2);
-    this.walk += speed * dt * 2.4 * (moveDot < -0.3 ? -1 : 1);
-    const amp = 0.62 * moving, sw = Math.sin(this.walk), cw = Math.cos(this.walk);
+    // Hit reaction: an underdamped spring, so a blow rocks the man and he rocks back.
+    for (let t = dt; t > 1e-6; t -= 0.008) {
+      const h = Math.min(0.008, t), fl = this.fl;
+      fl.vx += (-170 * fl.x - 13 * fl.vx) * h; fl.x += fl.vx * h;
+      fl.vz += (-170 * fl.z - 13 * fl.vz) * h; fl.z += fl.vz * h;
+    }
+    const flx = Math.max(-0.6, Math.min(0.6, this.fl.x)), flz = Math.max(-0.5, Math.min(0.5, this.fl.z));
+
+    // Legs. The stride phase advances with distance covered, at the rate a planted foot would
+    // move under a hip swinging through this amplitude, so the feet stop skating.
+    const speed = Math.hypot(fwd, side);
+    const moving = Math.min(1, speed / 3.0);
+    const amp = Math.min(0.75, 0.22 + speed * 0.11) * Math.min(1, speed / 0.6);
+    const legLen = (DIM.thigh + DIM.shin) * this.scale;
+    if (speed > 0.05) this.walk += (speed * dt * Math.PI) / (2 * legLen * Math.max(0.12, Math.sin(amp)));
+    const dz = speed > 0.05 ? fwd / speed : 1, dx = speed > 0.05 ? side / speed : 0;
+    const sw = Math.sin(this.walk), cw = Math.cos(this.walk);
     const crouch = Math.min(0.5, p.crouch + moving * 0.03);
     const ca = Math.acos(Math.max(0.2, 1 - crouch / (DIM.thigh + DIM.shin)));
     const upright = Math.abs(p.pitch) < 0.5 ? 1 : 0.25;
     const st = p.stance * (1 - moving) * upright;
-    this.solveLeg(this.legs.L, (sw * amp + st * 0.42) * upright, Math.max(0, cw) * amp * 1.3 + st * 0.2, ca * upright, 0.04 + st * 0.05);
-    this.solveLeg(this.legs.R, (-sw * amp - st * 0.38) * upright, Math.max(0, -cw) * amp * 1.3, ca * upright, -0.04 - st * 0.05);
+    const sideAmp = 0.6;
+    this.solveLeg(this.legs.L, (sw * amp * dz + st * 0.42) * upright, sw * amp * dx * sideAmp * upright, Math.max(0, cw) * amp * 1.3 + st * 0.2, ca * upright, 0.04 + st * 0.05);
+    this.solveLeg(this.legs.R, (-sw * amp * dz - st * 0.38) * upright, -sw * amp * dx * sideAmp * upright, Math.max(0, -cw) * amp * 1.3, ca * upright, -0.04 - st * 0.05);
 
-    const bob = Math.abs(cw) * 0.035 * moving;
-    this.hips.position.y = DIM.hip - (DIM.thigh + DIM.shin) * (1 - Math.cos(ca)) * 0.98 - bob - st * 0.03;
-    this.hips.rotation.set(p.lean * 0.5, p.twist * 0.35 + sw * 0.08 * moving, p.roll);
-    this.spine.rotation.set(p.lean * 0.5, p.twist * 0.65 - sw * 0.1 * moving, 0);
-    // Split skirts swing with the thighs, a little behind them.
-    this.skirts.L.rotation.x = this.legs.L.thigh.rotation.x * 0.62;
-    this.skirts.R.rotation.x = this.legs.R.thigh.rotation.x * 0.62;
-    this.head.rotation.set(p.headPitch - p.lean * 0.6, -p.twist * 0.7, 0);
+    // Hips carry the weight: bob on each footfall, sway over the planted foot, drift when idle.
+    const bob = Math.abs(cw) * 0.04 * moving;
+    const idle = 1 - moving;
+    const drift = Math.sin(this.clock * 0.7 + this.seed) * 0.012 * idle;
+    this.hips.position.set(drift + sw * 0.018 * moving * dz, DIM.hip - (DIM.thigh + DIM.shin) * (1 - Math.cos(ca)) * 0.98 - bob - st * 0.03, 0);
+    this.hips.rotation.set(p.lean * 0.5 + fwd * 0.012, p.twist * 0.35 + sw * 0.1 * moving * dz, p.roll - sw * 0.035 * moving - drift * 1.5 - side * 0.01);
+    const breath = Math.sin(this.clock * 1.7 + this.seed);
+    this.spine.position.y = DIM.waist + breath * 0.004;
+    this.spine.rotation.set(p.lean * 0.5 + flx + breath * 0.01, p.twist * 0.65 - sw * 0.12 * moving * dz, flz);
+    this.skirts.L.rotation.set(this.legs.L.thigh.rotation.x * 0.62, 0, this.legs.L.thigh.rotation.z * 0.5);
+    this.skirts.R.rotation.set(this.legs.R.thigh.rotation.x * 0.62, 0, this.legs.R.thigh.rotation.z * 0.5);
+
+    // Head: counter the torso twist, then turn toward whatever he is looking at, within a neck's reach.
+    let gy = -p.twist * 0.7, gp = 0;
+    const alive = f.state !== 'dead' && f.state !== 'gone' && f.state !== 'finished' && f.state !== 'down';
+    if (this.lookAt && alive) {
+      const l = this.root.worldToLocal(this._a.copy(this.lookAt));
+      gy = Math.max(-1.1, Math.min(1.1, Math.atan2(l.x, l.z) - p.twist));
+      gp = Math.max(-0.35, Math.min(0.45, -Math.atan2(l.y - 1.6, Math.hypot(l.x, l.z))));
+    }
+    [this.gaze.yaw, this.gaze.vy] = spring(this.gaze.yaw, this.gaze.vy, gy, 9, dt);
+    [this.gaze.pitch, this.gaze.vp] = spring(this.gaze.pitch, this.gaze.vp, gp, 9, dt);
+    this.head.rotation.set(p.headPitch - p.lean * 0.6 + flx * 0.9 + this.gaze.pitch, this.gaze.yaw, flz * 0.7);
     this.body.rotation.x = p.pitch;
     this.body.position.y = p.lift;
-    // On the ground the body pivots at the feet; slide it so the corpse lies where the man stood.
+    // On the ground the body pivots at the feet; slide it so the body lies where the man stood.
     this.body.position.z = -Math.sin(p.pitch) * DIM.hip * 0.6;
 
-    // Arms. Arm swing while walking is layered on the hand targets.
-    const swing = sw * 0.07 * moving;
+    // Arms. Swing against the legs while walking, layered on the hand targets.
+    const swing = sw * 0.08 * moving * dz;
     const rh: V3 = [p.rh[0], p.rh[1], p.rh[2] - swing];
     this.solveArm(this.arms.R, -1, rh, p.rdir);
     let lh: V3 = [p.lh[0], p.lh[1], p.lh[2] + swing];

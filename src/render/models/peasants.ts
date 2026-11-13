@@ -198,6 +198,7 @@ function buildBody(b: Body): Part[] {
 
 const VARIANTS: Record<string, number> = { mob: 10, farmhand: 5, woodcutter: 4, foreman: 1 };
 const cache = new Map<string, Part[]>();
+const figures = new Map<string, Part[]>();
 
 /** A complete peasant: body variant and head variant are picked independently from `seed`, so a mob rarely repeats. */
 export function buildPeasant(look: string, seed: number): Part[] {
@@ -207,8 +208,14 @@ export function buildPeasant(look: string, seed: number): Part[] {
   const bkey = `${look}:${bv}:${hp.female ? 'f' : 'm'}:${hp.skin}:${head.mantle ?? ''}`;
   let body = cache.get(bkey);
   if (!body) { const b = randomBody(bv + look.length * 17, look, hp.female, hp.skin); b.mantle = head.mantle; body = buildBody(b); cache.set(bkey, body); }
-  const parts: Part[] = [...body, { seg: 'head', kind: 'matte', geo: head.matte }];
-  if (head.metal) parts.push({ seg: 'head', kind: 'plate', geo: head.metal });
-  if (head.mail) parts.push({ seg: 'head', kind: 'mail', geo: head.mail });
+  // Cache the whole figure, so the rig can cache its skinned meshes against this exact array.
+  const key = `${bkey}|${look}:${hv}`;
+  let parts = figures.get(key);
+  if (!parts) {
+    parts = [...body, { seg: 'head', kind: 'matte', geo: head.matte }];
+    if (head.metal) parts.push({ seg: 'head', kind: 'plate', geo: head.metal });
+    if (head.mail) parts.push({ seg: 'head', kind: 'mail', geo: head.mail });
+    figures.set(key, parts);
+  }
   return parts;
 }

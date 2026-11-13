@@ -101,7 +101,11 @@ export function material(kind: Kind, blood = 0): THREE.MeshStandardMaterial {
   const map = shared.splat[blood];
   if (kind === 'matte') m = new THREE.MeshStandardMaterial({ vertexColors: true, map, roughness: 0.86 - blood * 0.05, metalness: 0, bumpMap: shared.weave, bumpScale: 0.6 });
   else if (kind === 'mail') m = new THREE.MeshStandardMaterial({ vertexColors: true, map, roughness: 0.82, metalness: 0.55, bumpMap: shared.rings.bump, bumpScale: 5, roughnessMap: shared.rings.rough });
-  else m = new THREE.MeshStandardMaterial({ vertexColors: true, map, roughness: 1, metalness: 0.9, roughnessMap: shared.scratch });
+  else m = new THREE.MeshStandardMaterial({ vertexColors: true, map, roughness: 1, metalness: 0.9, roughnessMap: shared.scratch, envMapIntensity: 0.45 });
+  // Firelight on polished steel was blowing out to white: keep plate from going glassy, and
+  // mail (a mass of tiny rings) duller still.
+  if (kind === 'plate') m.onBeforeCompile = (sh) => { sh.fragmentShader = sh.fragmentShader.replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\n\troughnessFactor = max(roughnessFactor, 0.52);'); };
+  if (kind === 'mail') m.envMapIntensity = 0.5;
   cache.set(key, m);
   return m;
 }

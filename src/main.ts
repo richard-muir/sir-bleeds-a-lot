@@ -182,12 +182,24 @@ function gallery(renderer: GameRenderer, q: URLSearchParams): void {
     f.x = cx + slot * gap; f.z = cz; f.facing = Math.PI;
   });
   const rot = ((+(q.get('rot') ?? 0)) * Math.PI) / 180, dist = +(q.get('dist') ?? 3.2), h = +(q.get('h') ?? 1.0), blood = +(q.get('blood') ?? 0);
-  let t = 0, last = performance.now(), broke = false;
+  let t = 0, last = performance.now(), broke = false, killed = false;
+  const start = performance.now();
   const loop = (now: number) => {
     const dt = Math.min(0.1, (now - last) / 1000); last = now; t += dt;
-    for (const f of world.fighters) { f.facing = Math.PI + rot + (q.has('spin') ? t * 0.6 : 0); f.blood = blood; }
+    for (const f of world.fighters) { if (f.state !== 'dead') f.facing = Math.PI + rot + (q.has('spin') ? t * 0.6 : 0); f.blood = blood; }
     renderer.frame(world, dt, dt, { yaw: 0, pitch: 0, lock: 0, debugHitboxes: false, paused: false, menu: false, cam: { pos: [cx, h + dist * 0.12, cz - dist], look: [cx, h, cz], fov: 34 } });
     if (!broke && q.get('break')) { broke = true; for (const id of q.get('break')!.split(',')) renderer.rigOf(k.id)?.breakArmour(id); }
+    // ?kill=1 drops every peasant as if struck from the camera side; ?sever=armR,head takes those off first.
+    if (q.has('kill') && !killed && now - start > 1500) {
+      killed = true;
+      for (const f of world.fighters) {
+        if (f.team !== 1) continue;
+        for (const limb of (q.get('sever') ?? '').split(',').filter(Boolean)) renderer.handle({ t: 'sever', id: f.id, limb: limb as never, dirX: 0.3, dirZ: 1, force: 1 }, world);
+        renderer.handle({ t: 'hit', id: f.id, by: k.id, zone: 'torso', dmg: 40, type: 'cut', killed: true, x: f.x, z: f.z, dirX: (Math.random() - 0.5) * 0.6, dirZ: 1, heavy: true }, world);
+        f.state = 'dead';
+        renderer.handle({ t: 'death', id: f.id, by: k.id }, world);
+      }
+    }
     requestAnimationFrame(loop);
   };
   requestAnimationFrame(loop);

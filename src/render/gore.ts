@@ -1,12 +1,14 @@
-import RAPIER from '@dimforge/rapier3d-compat';
+import type * as RAPIER from '@dimforge/rapier3d-compat';
 import * as THREE from 'three';
+import { GROUP_DEBRIS, GROUP_GROUND, type Ragdoll, type RapierNS } from './ragdoll';
 
-// Blood, decals and flying body parts. Everything is pooled and capped so a long fight
-// cannot grow memory or draw calls without bound. Rapier drives the severed pieces only:
-// they are cosmetic, so they live on the render side and never touch the deterministic sim.
+// Blood, decals, flying body parts and ragdolls. Everything is pooled and capped so a long
+// fight cannot grow memory or draw calls without bound. Rapier drives only cosmetic things, so it
+// lives on the render side and never touches the deterministic sim. It loads in the background
+// (it is most of the download), and until it arrives limbs just vanish and corpses fall by pose.
 
 export type GoreLevel = 'full' | 'reduced' | 'off';
-const MAX_DROPS = 700, MAX_DECALS = 420, MAX_DEBRIS = 48;
+const MAX_DROPS = 700, MAX_DECALS = 420, MAX_DEBRIS = 48, MAX_RAGDOLLS = 12, RAGDOLL_LIFE = 7;
 
 interface Debris { obj: THREE.Object3D; body: RAPIER.RigidBody; age: number; bleed: number }
 
@@ -31,7 +33,9 @@ export class Gore {
   private decalN = 0;
   private decalInfo: { x: number; z: number; rot: number; size: number; grow: number }[] = [];
   private debris: Debris[] = [];
-  private physics: RAPIER.World | null = null;
+  physics: RAPIER.World | null = null;
+  R: RapierNS | null = null;
+  private ragdolls: Ragdoll[] = [];
   private m = new THREE.Matrix4(); private q = new THREE.Quaternion(); private v = new THREE.Vector3(); private s = new THREE.Vector3();
   private flat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
 
@@ -49,9 +53,23 @@ export class Gore {
   }
 
   async init(): Promise<void> {
-    await RAPIER.init();
-    this.physics = new RAPIER.World({ x: 0, y: -18, z: 0 });
-    this.physics.createCollider(RAPIER.ColliderDesc.cuboid(60, 0.5, 60).setTranslation(0, -0.5, 0).setFriction(1.1));
+    const R = (await import('@dimforge/rapier3d-compat')).default;
+    await R.init();
+    const w = new R.World({ x: 0, y: -18, z: 0 });
+    const C = R.ColliderDesc, G = GROUP_GROUND;
+    w.createCollider(C.cuboid(60, 0.5, 60).setTranslation(0, -0.5, 0).setFriction(1.1).setCollisionGroups(G));
+    // The square's furniture, so bodies and limbs fetch up against it.
+    w.createCollider(C.cylinder(0.45, 1.15).setTranslation(0, 0.45, 0).setCollisionGroups(G));
+    w.createCollider(C.cylinder(2.5, 0.17).setTranslation(8, 2.5, -6.5).setCollisionGroups(G));
+    w.createCollider(C.cuboid(1.3, 0.55, 0.75).setTranslation(-7.5, 0.6, 6).setRotation({ x: 0, y: Math.sin(0.25), z: 0, w: Math.cos(0.25) }).setCollisionGroups(G));
+    this.R = R;
+    this.physics = w;
+  }
+
+  /** Register a ragdoll so it is stepped, aged and eventually frozen in place. */
+  addRagdoll(r: Ragdoll): void {
+    this.ragdolls.push(r);
+    while (this.ragdolls.length > MAX_RAGDOLLS) this.ragdolls.shift()!.freeze();
   }
 
   /** A burst of blood from a wound, thrown along the blow. */
@@ -86,7 +104,8 @@ export class Gore {
    * `len` is the piece's length hanging below its origin, used for the collider.
    */
   fling(obj: THREE.Object3D, len: number, radius: number, vel: THREE.Vector3, bleed = 0): void {
-    if (!this.physics) return;
+    const R = this.R;
+    if (!this.physics || !R) { obj.removeFromParent(); return; }
     obj.updateWorldMatrix(true, false);
     const pos = new THREE.Vector3(), quat = new THREE.Quaternion(), scl = new THREE.Vector3();
     obj.matrixWorld.decompose(pos, quat, scl);
@@ -99,12 +118,12 @@ export class Gore {
     this.scene.add(wrap);
     if (this.level === 'off') { wrap.visible = false; }
     const body = this.physics.createRigidBody(
-      RAPIER.RigidBodyDesc.dynamic().setTranslation(centre.x, Math.max(radius + 0.02, centre.y), centre.z).setRotation(quat)
+      R.RigidBodyDesc.dynamic().setTranslation(centre.x, Math.max(radius + 0.02, centre.y), centre.z).setRotation(quat)
         .setLinvel(vel.x, vel.y, vel.z).setAngvel({ x: (Math.random() - 0.5) * 14, y: (Math.random() - 0.5) * 8, z: (Math.random() - 0.5) * 14 })
         .setLinearDamping(0.3).setAngularDamping(1.2));
     const half = Math.max(0.01, (len * scl.y) / 2 - radius);
-    const col = len > radius * 2.5 ? RAPIER.ColliderDesc.capsule(half, radius) : RAPIER.ColliderDesc.ball(radius);
-    this.physics.createCollider(col.setFriction(1).setRestitution(0.15).setDensity(1.2), body);
+    const col = len > radius * 2.5 ? R.ColliderDesc.capsule(half, radius) : R.ColliderDesc.ball(radius);
+    this.physics.createCollider(col.setFriction(1).setRestitution(0.15).setDensity(1.2).setCollisionGroups(GROUP_DEBRIS), body);
     this.debris.push({ obj: wrap, body, age: 0, bleed });
     if (this.debris.length > MAX_DEBRIS) this.removeDebris(0);
   }
@@ -158,12 +177,19 @@ export class Gore {
         if (b.age > 3 && b.age < 3.1 && b.bleed > 0) this.decal(t.x, t.z, 0.5, 0.5);
         if (b.age > 4 && !b.body.isSleeping()) b.body.sleep();
       }
+      for (let i = this.ragdolls.length - 1; i >= 0; i--) {
+        const r = this.ragdolls[i];
+        r.age += dt;
+        if (r.frozen || r.age > RAGDOLL_LIFE || (r.age > 1.5 && r.sleeping)) { r.freeze(); this.ragdolls.splice(i, 1); }
+      }
     }
   }
   private static UP = new THREE.Vector3(0, 1, 0);
 
   clear(): void {
     while (this.debris.length) this.removeDebris(0);
+    for (const r of this.ragdolls) r.freeze();
+    this.ragdolls = [];
     const zero = new THREE.Matrix4().makeScale(0, 0, 0);
     for (let i = 0; i < MAX_DECALS; i++) this.decals.setMatrixAt(i, zero);
     this.decalInfo = [];

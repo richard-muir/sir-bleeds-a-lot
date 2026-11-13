@@ -199,7 +199,7 @@ function sculptCop(r: number): THREE.BufferGeometry {
 function plateKit(): Part[] {
   const P: Part[] = [];
   const add = (seg: Seg, kind: Kind, geos: (THREE.BufferGeometry | false | null | undefined)[], piece?: string) => { const g = merge(geos); if (g.attributes.position) P.push({ seg, kind, geo: g, piece }); };
-  const BRIGHT = 0x868c94, HELM = 'bascinet', sp = steelPaint(0.25);
+  const BRIGHT = 0x7c828a, HELM = 'bascinet', sp = steelPaint(0.25);
   const edge = (y: number, w = 0.012) => (p: THREE.Vector3, c: THREE.Color) => { sp.fn(p, c); if (Math.abs(p.y - y) < w) c.set(BRASS).multiplyScalar(0.9); };
 
   // ----- houndskull bascinet
