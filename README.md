@@ -75,12 +75,12 @@ Every fighter, player or peasant, is driven by a `Command` (`src/sim/types.ts`):
 
 ## How to add things
 
-**A weapon.** Add an entry to `WEAPONS` in `src/data/gear.ts` (damage, type, reach, weight, `model`). If it needs a new look, add a case to `buildWeapon` in `src/render/rig.ts`. Give it to a peasant by listing its id in that peasant's `weapons`.
+**A weapon.** Add an entry to `WEAPONS` in `src/data/gear.ts` (damage, type, reach, weight, `model`). If it needs a new look, add a builder to `src/render/models/weapons.ts`. Give it to a peasant by listing its id in that peasant's `weapons`.
 
 **A peasant type.**
 1. Add a `FighterDef` to `src/data/peasants.ts` (health, speed, morale, token cost, preferred range, `moveset`, `weapons`, `look`).
 2. If it attacks differently, add a moveset to `src/data/moves.ts`. Each move names an `anim`; add that animation to `ANIMS` in `src/render/rig.ts` if it is new.
-3. If it looks different, add a branch to `dressPeasant` in `src/render/rig.ts`.
+3. If it looks different, add a branch to `randomBody` / `randomHead` in `src/render/models/`.
 4. If it behaves differently (not just circle, wait for a token, attack), add the behaviour to `think` in `src/sim/ai.ts`.
 5. Put it in a wave in `src/data/waves.ts`.
 
@@ -105,7 +105,8 @@ Calls made where the brief was silent or contradicted itself.
 - **Milestone 1 scope follows section 5, not the shorter list in section 10.** Dodge, parry and riposte, the full combo table, shield bash, the Wrath meter with the shield-charge special, finishers, input buffering, cancel windows, hit-stop and basic morale are all in, because they are what makes the moveset feel right. Bloodrage is not; it is the first thing to build in Milestone 2.
 - **Five waves, the fifth led by an elite foreman** standing in for Sir Vival, who arrives with the boss system in Milestone 3.
 - **WebGL 2 renderer for now.** Three's WebGPU renderer needs a different material and post-processing stack. It is deferred to Milestone 4 so it does not hold up combat feel.
-- **Art is procedural placeholder.** Characters are built in code from primitives on one shared skeleton and animated procedurally (arm IK driven by hand targets, FK legs). This is not the "grim painterly realism" target. The rig's joint layout and pose structure are the seam for glTF models and animation clips. No third-party art, audio or model assets are used, so there are no asset licences to list yet. Fonts are Pirata One and IM Fell English (SIL Open Font Licence), bundled through Fontsource.
+- **Characters are sculpted in code.** `src/render/models/` holds a small modelling toolkit (`geo.ts`: lofted sections, swept tubes, displaced spheres, painted vertex colour) and the models built with it: the knight in two harnesses (`knight.ts`), peasant bodies and clothes (`peasants.ts`), faces, hair and hats (`heads.ts`), weapons and shield (`weapons.ts`). Each body segment is one merged mesh on three shared materials (cloth/skin, mail, plate), each with four blood levels. Peasants mix body and head variants so a mob rarely repeats. Animation is still procedural (arm IK driven by hand targets, FK legs). No third-party art, audio or model assets are used, so there are no asset licences to list yet. Fonts are Pirata One and IM Fell English (SIL Open Font Licence), bundled through Fontsource.
+- **Model gallery.** Add `?gallery=all` to the URL (or `knight`, `plate`, `mob`, `farmhand`, `woodcutter`, `foreman`) to inspect models without a fight. Options: `rot` (degrees), `dist`, `h` (look height), `n`, `blood` (0 to 1), `break` (armour piece ids), `spin=1`.
 - **Rapier drives only cosmetic debris** (severed limbs, heads, dropped weapons). Hits use the sim's own deterministic arc-and-reach test on a 2D plane, so the same commands always give the same fight, which future PvP needs.
 - **Hit-stop lives in the simulation** (as frozen ticks) so it stays deterministic.
 - **Only cuts sever limbs.** Blunt and pierce damage the limb and the health bar but leave it attached.
@@ -136,7 +137,7 @@ Calls made where the brief was silent or contradicted itself.
 **Rough**
 
 - Feel has only been checked by automated runs and screenshots in a headless browser. Nobody has played it with a mouse yet. The targeting acceptance test (9 in 10 intended hits in a crowd of 20+) and the frame-rate target need a human on real hardware.
-- Art, animation and sound are placeholders, as above. Walk cycles skate a little; corpses fall by animation, not ragdoll.
+- Animation and sound are still placeholders. Walk cycles skate a little; corpses fall by animation, not ragdoll. Limbs are rigid segments, so shoulders and elbows show their joints.
 - The knight has no roll (light kit) animation distinct from the sidestep.
 - The camera stays inside the palisade but does not yet avoid the well roof or the gibbet post.
 - The JavaScript bundle is about 5 MB (1.9 MB gzipped), mostly Rapier's embedded WebAssembly.

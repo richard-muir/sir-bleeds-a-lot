@@ -24,6 +24,7 @@ async function boot(): Promise<void> {
 
   const renderer = new GameRenderer(canvas, quality);
   await renderer.init();
+  if (params.has('gallery')) { gallery(renderer, params); return; }
   const input = new Input(canvas);
   const audio = new GameAudio();
   let world = new World(Date.now() % 100000);
@@ -155,6 +156,41 @@ async function boot(): Promise<void> {
     requestAnimationFrame(frame);
   }
   requestAnimationFrame(frame);
+}
+
+/**
+ * Model gallery: ?gallery=knight|plate|mob|farmhand|woodcutter|foreman|all
+ * Optional: rot (degrees), dist, h (look height), n (how many), blood (0..1), break (armour piece id), spin=1.
+ */
+function gallery(renderer: GameRenderer, q: URLSearchParams): void {
+  const what = q.get('gallery') || 'all';
+  const world = new World(11);
+  world.wave.queue = [];
+  const n = +(q.get('n') ?? 5);
+  const line: { type: string; elite?: boolean }[] = what === 'all'
+    ? [{ type: 'mob' }, { type: 'mob' }, { type: 'farmhand' }, { type: 'woodcutter' }, { type: 'woodcutter', elite: true }, { type: 'mob' }, { type: 'mob' }]
+    : what === 'knight' || what === 'plate' ? [] : Array.from({ length: n }, () => ({ type: what === 'foreman' ? 'woodcutter' : what, elite: what === 'foreman' }));
+  const k = world.knight;
+  if (what === 'plate' || q.get('kit') === 'plate') world.applyKit(k, 'plate');
+  const cx = 6, cz = 6, gap = 1.05;
+  const showKnight = what === 'all' || what === 'knight' || what === 'plate';
+  k.x = showKnight ? cx : 60; k.z = cz; k.facing = Math.PI;
+  line.forEach((l, i) => {
+    const fd = l.type;
+    const f = world.spawn({ type: fd, at: 0, gate: 0, name: 'Model', elite: !!l.elite, weapon: ({ mob: ['club', 'rake', 'fryingPan', 'rollingPin'][i % 4], farmhand: 'pitchfork', woodcutter: 'fellingAxe' } as Record<string, string>)[fd] });
+    const slot = showKnight ? (i < line.length / 2 ? i - Math.ceil(line.length / 2) : i - Math.floor(line.length / 2) + 1) : i - (line.length - 1) / 2;
+    f.x = cx + slot * gap; f.z = cz; f.facing = Math.PI;
+  });
+  const rot = ((+(q.get('rot') ?? 0)) * Math.PI) / 180, dist = +(q.get('dist') ?? 3.2), h = +(q.get('h') ?? 1.0), blood = +(q.get('blood') ?? 0);
+  let t = 0, last = performance.now(), broke = false;
+  const loop = (now: number) => {
+    const dt = Math.min(0.1, (now - last) / 1000); last = now; t += dt;
+    for (const f of world.fighters) { f.facing = Math.PI + rot + (q.has('spin') ? t * 0.6 : 0); f.blood = blood; }
+    renderer.frame(world, dt, dt, { yaw: 0, pitch: 0, lock: 0, debugHitboxes: false, paused: false, menu: false, cam: { pos: [cx, h + dist * 0.12, cz - dist], look: [cx, h, cz], fov: 34 } });
+    if (!broke && q.get('break')) { broke = true; for (const id of q.get('break')!.split(',')) renderer.rigOf(k.id)?.breakArmour(id); }
+    requestAnimationFrame(loop);
+  };
+  requestAnimationFrame(loop);
 }
 
 function guessQuality(): 'low' | 'high' {

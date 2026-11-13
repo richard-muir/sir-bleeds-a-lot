@@ -34,7 +34,7 @@ const GradeShader = {
       float red = smoothstep(0.06, 0.3, col.r - max(col.g, col.b) * 1.25);
       float fire = smoothstep(0.5, 1.0, l) * step(col.b, col.r);
       float keep = max(red, fire * 0.8);
-      col = mix(mix(vec3(l), col, 0.42), col * vec3(1.12, 0.92, 0.92), keep);
+      col = mix(mix(vec3(l), col, 0.42), col * vec3(1.04, 0.92, 0.92), keep);
       col = mix(col, col * vec3(1.02, 0.99, 0.93), 0.6);
       col = (col - 0.5) * 1.06 + 0.5;
       float r = length(c * vec2(1.0, 0.82));
@@ -56,7 +56,7 @@ function glintTexture(): THREE.Texture {
   return new THREE.CanvasTexture(c);
 }
 
-export interface FrameOpts { yaw: number; pitch: number; lock: number; debugHitboxes: boolean; paused: boolean; menu: boolean }
+export interface FrameOpts { yaw: number; pitch: number; lock: number; debugHitboxes: boolean; paused: boolean; menu: boolean; cam?: { pos: [number, number, number]; look: [number, number, number]; fov?: number } }
 
 export class GameRenderer {
   three: THREE.WebGLRenderer;
@@ -115,7 +115,7 @@ export class GameRenderer {
     if (quality === 'high') {
       const c = (this.composer = new EffectComposer(this.three));
       c.addPass(new RenderPass(this.scene, this.camera));
-      c.addPass(new UnrealBloomPass(new THREE.Vector2(256, 256), 0.55, 0.7, 0.82));
+      c.addPass(new UnrealBloomPass(new THREE.Vector2(256, 256), 0.4, 0.6, 0.93));
       c.addPass((this.grade = new ShaderPass(GradeShader)));
       c.addPass(new OutputPass());
     }
@@ -137,7 +137,8 @@ export class GameRenderer {
   // ---------------------------------------------------------------- views
 
   private makeView(f: Fighter, kit?: string): View {
-    const rig = new Rig(f.def.look, f.weapon?.model ?? null, { scale: (f.def.scale ?? 1) * (f.elite ? 1.2 : 0.94 + ((f.id * 37) % 13) / 100), kit, shield: !!f.shield, twoHanded: f.weapon?.twoHanded });
+    const knight = f.def.look === 'knight';
+    const rig = new Rig(f.elite ? 'foreman' : f.def.look, f.weapon?.model ?? null, { scale: knight ? 1.1 : (f.def.scale ?? 1) * (f.elite ? 1.18 : 0.93 + ((f.id * 37) % 13) / 100), kit, shield: !!f.shield, twoHanded: f.weapon?.twoHanded, seed: f.id * 2654435761 >>> 8 });
     this.scene.add(rig.root);
     const v: View = { rig, f, x: f.x, z: f.z, yaw: f.facing, px: f.x, pz: f.z, kit, sink: 0 };
     rig.root.position.set(f.x, 0, f.z); rig.root.rotation.y = f.facing;
@@ -149,7 +150,7 @@ export class GameRenderer {
     for (const f of world.fighters) {
       live.add(f.id);
       let v = this.views.get(f.id);
-      if (v && f === world.knight && (v.kit !== world.kitId || (f.weapon && !v.rig.weapon && f.limbs.armR.state === 'ok') || (f.limbs.head.state === 'ok' && !v.rig.head.parent) || this.knightNeedsLimbs(v, f))) {
+      if (v && f === world.knight && (v.kit !== world.kitId || (f.weapon && !v.rig.weapon && f.limbs.armR.state === 'ok') || (f.limbs.head.state === 'ok' && !v.rig.hasLimb('head')) || this.knightNeedsLimbs(v, f))) {
         // New kit, or the barber-surgeon has been: rebuild the knight.
         v.rig.root.removeFromParent(); this.views.delete(f.id); v = undefined;
       }
@@ -175,7 +176,7 @@ export class GameRenderer {
     for (const c of this.corpses) c.rig.update(c.f, dt, 0, 1);
   }
   private knightNeedsLimbs(v: View, f: Fighter): boolean {
-    for (const l of ['armL', 'armR', 'legL', 'legR'] as Limb[]) if (f.limbs[l].state === 'ok' && !v.rig.limbGroup(l)) return true;
+    for (const l of ['armL', 'armR', 'legL', 'legR'] as Limb[]) if (f.limbs[l].state === 'ok' && !v.rig.hasLimb(l)) return true;
     return false;
   }
 
@@ -364,6 +365,11 @@ export class GameRenderer {
   private updateCamera(world: World, kv: View, dt: number, o: FrameOpts): void {
     const k = world.knight;
     const R = TUNING.arenaRadius;
+    if (o.cam) { // fixed camera for the model gallery
+      this.camera.position.set(...o.cam.pos); this.camera.lookAt(...o.cam.look);
+      if (o.cam.fov && this.camera.fov !== o.cam.fov) { this.camera.fov = o.cam.fov; this.camera.updateProjectionMatrix(); }
+      return;
+    }
     if (o.menu) { // slow orbit behind the title screen
       this.menuAngle += dt * 0.07;
       const a = this.menuAngle + 2.6;
@@ -407,6 +413,7 @@ export class GameRenderer {
     const v = new THREE.Vector3(x, y, z).project(this.camera);
     return { x: (v.x * 0.5 + 0.5) * window.innerWidth, y: (-v.y * 0.5 + 0.5) * window.innerHeight, behind: v.z > 1 };
   }
+  rigOf(id: number): Rig | undefined { return this.views.get(id)?.rig; }
   viewPos(id: number): { x: number; z: number; scale: number } | null {
     const v = this.views.get(id);
     return v ? { x: v.x, z: v.z, scale: v.rig.scale } : null;

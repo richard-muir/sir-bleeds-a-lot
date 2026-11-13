@@ -15,12 +15,12 @@ const plate = { cut: 0.9, blunt: 0.5, pierce: 0.75 };
 
 export const ARMOUR: Record<string, ArmourPieceDef> = Object.fromEntries(([
   // Mail kit: Sir Bleedsalot's starting harness.
-  { id: 'nasalHelm', name: 'Nasal helm and coif', zones: ['head'], prot: { cut: 0.8, blunt: 0.4, pierce: 0.6 }, durability: 150, weight: 3.2, material: 'plate' },
+  { id: 'greatHelm', name: 'Great helm and coif', zones: ['head'], prot: { cut: 0.8, blunt: 0.4, pierce: 0.6 }, durability: 150, weight: 3.2, material: 'plate' },
   { id: 'hauberk', name: 'Mail hauberk', zones: ['torso'], prot: mail, durability: 260, weight: 10, material: 'mail' },
   { id: 'mailSleeves', name: 'Mail sleeves', zones: ['armL', 'armR'], prot: mail, durability: 160, weight: 3, material: 'mail' },
   { id: 'chausses', name: 'Mail chausses', zones: ['legL', 'legR'], prot: mail, durability: 170, weight: 5, material: 'mail' },
   // Plate kit: used by the debug panel to prove the weight trade-off before the armoury exists.
-  { id: 'greatHelm', name: 'Great helm', zones: ['head'], prot: plate, durability: 260, weight: 4.5, material: 'plate' },
+  { id: 'bascinet', name: 'Houndskull bascinet', zones: ['head'], prot: plate, durability: 260, weight: 4.5, material: 'plate' },
   { id: 'cuirass', name: 'Cuirass', zones: ['torso'], prot: plate, durability: 420, weight: 14, material: 'plate' },
   { id: 'plateArms', name: 'Pauldrons and vambraces', zones: ['armL', 'armR'], prot: plate, durability: 260, weight: 6, material: 'plate' },
   { id: 'plateLegs', name: 'Cuisses and greaves', zones: ['legL', 'legR'], prot: plate, durability: 280, weight: 9, material: 'plate' },
@@ -30,8 +30,8 @@ export const ARMOUR: Record<string, ArmourPieceDef> = Object.fromEntries(([
 ] as ArmourPieceDef[]).map((a) => [a.id, a]));
 
 export const KITS: Record<string, KitDef> = {
-  mail: { id: 'mail', name: 'Mail harness', weapon: 'armingSword', shield: 'heater', armour: ['nasalHelm', 'hauberk', 'mailSleeves', 'chausses'] },
-  plate: { id: 'plate', name: 'Full plate', weapon: 'armingSword', shield: 'heater', armour: ['greatHelm', 'cuirass', 'plateArms', 'plateLegs'] },
+  mail: { id: 'mail', name: 'Mail harness', weapon: 'armingSword', shield: 'heater', armour: ['greatHelm', 'hauberk', 'mailSleeves', 'chausses'] },
+  plate: { id: 'plate', name: 'Full plate', weapon: 'armingSword', shield: 'heater', armour: ['bascinet', 'cuirass', 'plateArms', 'plateLegs'] },
 };
 
 /** Weight classes from the brief (kg of kit, weapon and shield included). */
